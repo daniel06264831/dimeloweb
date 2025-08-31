@@ -34,18 +34,16 @@ const emojis = [
 // Emoji picker logic
 emojiBtn.onclick = (e) => {
     e.preventDefault();
-    if (emojiPicker.style.display === "none") {
-        emojiPicker.innerHTML = emojis.map(e => `<button type="button" class="emoji">${e}</button>`).join('');
-        const rect = emojiBtn.getBoundingClientRect();
-        emojiPicker.style.display = "block";
-        emojiPicker.style.left = rect.left + "px";
-        emojiPicker.style.top = (rect.top - 180) + "px";
-    } else {
-        emojiPicker.style.display = "none";
-    }
+    emojiPicker.innerHTML = emojis.map(e => `<button type="button" class="emoji">${e}</button>`).join('');
+    const rect = emojiBtn.getBoundingClientRect();
+    emojiPicker.style.display = "block";
+    emojiPicker.style.left = rect.left + "px";
+    emojiPicker.style.top = (rect.top - 180) + "px";
 };
+
 emojiPicker.onclick = function(ev) {
     if (ev.target.classList.contains('emoji')) {
+        ev.preventDefault(); // Evita que el formulario se envíe accidentalmente
         input.value += ev.target.textContent;
         emojiPicker.style.display = "none";
         input.focus();
@@ -307,3 +305,4 @@ window.addEventListener('DOMContentLoaded', () => {
         joinRoomName.focus();
     }
 });
+    
