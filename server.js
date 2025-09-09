@@ -12,9 +12,14 @@ const nodemailer = require('nodemailer');
 const { MongoClient } = require('mongodb');
 const cors = require('cors');
 
-// MongoDB connection (default to provided URI)
-process.env.MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://daniel:daniel25@capacitacion.nxd7yl9.mongodb.net/?retryWrites=true&w=majority&appName=capacitacion&authSource=admin';
-// Defaults to avoid requiring a .env on Render
+// Require MongoDB URI to be provided by Render environment variables
+if (!process.env.MONGODB_URI) {
+  console.error('MONGODB_URI is not set. Please set it in Render environment variables.');
+  process.exit(1);
+}
+const MONGODB_URI = process.env.MONGODB_URI;
+
+// Defaults for Render deployment (can be overridden in environment variables)
 process.env.CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'https://dimeloweb.onrender.com';
 process.env.SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 process.env.SMTP_PORT = process.env.SMTP_PORT || '587';
@@ -25,11 +30,6 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: process.env.CLIENT_ORIGIN || '*' } });
 
-const DATA_DIR = path.join(__dirname, 'data');
-const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
-const TRANSACTIONS_FILE = path.join(DATA_DIR, 'transactions.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-
 const upload = multer({ dest: path.join(__dirname, 'uploads') });
 
 app.use(express.json());
@@ -37,12 +37,6 @@ app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }));
 // static serving moved below after API routes to avoid static fallback for /api/*
 
 app.use(express.static(path.join(__dirname, 'public')));
-
-// Ensure data directory and file exist
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, JSON.stringify({ projects: [] }, null, 2));
-if (!fs.existsSync(TRANSACTIONS_FILE)) fs.writeFileSync(TRANSACTIONS_FILE, JSON.stringify({ transactions: [] }, null, 2));
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({ users: [] }, null, 2));
 
 // In-memory caches (backed by MongoDB)
 let dbClient = null;
@@ -52,57 +46,20 @@ let transactionsCache = [];
 let usersCache = [];
 
 async function initDb() {
-  const uri = process.env.MONGODB_URI;
-  const opt = { useNewUrlParser: true, useUnifiedTopology: true };
-  dbClient = await MongoClient.connect(uri, opt);
+  const uri = MONGODB_URI;
+  dbClient = await MongoClient.connect(uri);
   db = dbClient.db();
 
-  // Load existing collections into cache; if empty, seed from local JSON files
+  // Load collections into in-memory caches (no local seeding in Render)
   const pColl = db.collection('projects');
   const tColl = db.collection('transactions');
   const uColl = db.collection('users');
 
   projectsCache = await pColl.find({}).toArray();
-  if (!projectsCache || projectsCache.length === 0) {
-    try {
-      const raw = fs.readFileSync(PROJECTS_FILE, 'utf8');
-      const local = JSON.parse(raw);
-      if (local.projects && local.projects.length) {
-        // ensure docs have id field
-        const docs = local.projects.map(p => Object.assign({}, p));
-        await pColl.insertMany(docs);
-        projectsCache = await pColl.find({}).toArray();
-      }
-    } catch (e) { /* ignore */ }
-  }
-
   transactionsCache = await tColl.find({}).toArray();
-  if (!transactionsCache || transactionsCache.length === 0) {
-    try {
-      const raw = fs.readFileSync(TRANSACTIONS_FILE, 'utf8');
-      const local = JSON.parse(raw);
-      if (local.transactions && local.transactions.length) {
-        const docs = local.transactions.map(t => Object.assign({}, t));
-        await tColl.insertMany(docs);
-        transactionsCache = await tColl.find({}).toArray();
-      }
-    } catch (e) { /* ignore */ }
-  }
-
   usersCache = await uColl.find({}).toArray();
-  if (!usersCache || usersCache.length === 0) {
-    try {
-      const raw = fs.readFileSync(USERS_FILE, 'utf8');
-      const local = JSON.parse(raw);
-      if (local.users && local.users.length) {
-        const docs = local.users.map(u => Object.assign({}, u));
-        await uColl.insertMany(docs);
-        usersCache = await uColl.find({}).toArray();
-      }
-    } catch (e) { /* ignore */ }
-  }
 
-  console.log('Connected to MongoDB and caches initialized');
+  console.log('Connected to MongoDB and caches initialized (no local files used)');
 }
 
 // Replace file-based read/write with cache-backed helpers
@@ -592,7 +549,8 @@ async function startServer() {
   try {
     await initDb();
   } catch (err) {
-    console.error('DB init failed, continuing with local files only', err);
+    console.error('DB init failed, aborting. Ensure MONGODB_URI is correct.', err);
+    process.exit(1);
   }
 
   server.listen(PORT, HOST, () => console.log(`Server listening on http://${HOST}:${PORT}`));
