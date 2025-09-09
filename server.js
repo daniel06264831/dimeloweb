@@ -12,12 +12,8 @@ const nodemailer = require('nodemailer');
 const { MongoClient } = require('mongodb');
 const cors = require('cors');
 
-// Require MongoDB URI to be provided by Render environment variables
-if (!process.env.MONGODB_URI) {
-  console.error('MONGODB_URI is not set. Please set it in Render environment variables.');
-  process.exit(1);
-}
-const MONGODB_URI = process.env.MONGODB_URI;
+// MongoDB URI: use environment variable if provided, otherwise fall back to default
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://daniel:daniel25@capacitacion.nxd7yl9.mongodb.net/?retryWrites=true&w=majority&appName=capacitacion&authSource=admin';
 
 // Defaults for Render deployment (can be overridden in environment variables)
 process.env.CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'https://dimeloweb.onrender.com';
@@ -549,8 +545,8 @@ async function startServer() {
   try {
     await initDb();
   } catch (err) {
-    console.error('DB init failed, aborting. Ensure MONGODB_URI is correct.', err);
-    process.exit(1);
+    console.error('DB init failed:', err);
+    // continue running but app will be read-only until DB is available
   }
 
   server.listen(PORT, HOST, () => console.log(`Server listening on http://${HOST}:${PORT}`));
