@@ -481,3 +481,4 @@ server.listen(PORT, '0.0.0.0', () => {
 	console.log(`Servidor escuchando en puerto ${PORT}`);
 	console.log(`Socket.IO origin permitido: ${RENDER_URL}`);
 });
+
