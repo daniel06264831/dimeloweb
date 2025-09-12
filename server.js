@@ -250,10 +250,10 @@ app.post('/api/wallet/pay', async (req, res) => {
 	}
 });
 
-// NUEVO: listar pagos programados
+// NUEVO: listar pagos programados (solo activos)
 app.get('/api/scheduled', async (req, res) => {
 	try {
-		const list = await scheduledPayments.find().sort({ nextDue: 1 }).toArray();
+		const list = await scheduledPayments.find({ $or: [ { active: { $ne: false } }, { active: { $exists: false } } ] }).sort({ nextDue: 1 }).toArray();
 		const mapped = list.map(s => ({ ...s, _id: s._id ? s._id.toString() : s._id }));
 		res.json(mapped);
 	} catch (err) {
@@ -270,8 +270,8 @@ app.post('/api/scheduled', async (req, res) => {
 		const doc = {
 			description,
 			amount: Number(amount),
-			type: type || 'expense', // por defecto gasto
-			frequency, // 'weekly' | 'monthly' | 'once'
+			type: type || 'expense',
+			frequency, // 'weekly' | 'monthly' | 'biweekly' | 'once'
 			nextDue: new Date(nextDue),
 			endDate: endDate ? new Date(endDate) : null,
 			category: category || 'General',
@@ -298,7 +298,6 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		const sched = await scheduledPayments.findOne({ _id: new ObjectId(id) });
 		if (!sched) return res.status(404).json({ error: 'Programado no encontrado' });
 
-		// crear transacción asociada
 		const tx = {
 			description: `${sched.description} (pago programado)`,
 			amount: Number(sched.amount),
@@ -311,12 +310,13 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		const r = await transactions.insertOne(tx);
 		tx._id = r.insertedId.toString();
 
-		// actualizar lastPaid y calcular nextDue según frecuencia
 		const now = new Date();
 		let next = sched.nextDue ? new Date(sched.nextDue) : now;
 		// avanzar una unidad a partir de la fecha actual o nextDue
 		if (sched.frequency === 'weekly') {
 			next = new Date(next.getTime() + 7 * 24 * 60 * 60 * 1000);
+		} else if (sched.frequency === 'biweekly') {
+			next = new Date(next.getTime() + 14 * 24 * 60 * 60 * 1000);
 		} else if (sched.frequency === 'monthly') {
 			next = new Date(next);
 			next.setMonth(next.getMonth() + 1);
@@ -327,20 +327,25 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		}
 
 		// si hay endDate y next > endDate -> desactivar
+		let ended = false;
 		if (sched.endDate && next && next > new Date(sched.endDate)) {
 			sched.active = false;
 			next = null;
+			ended = true;
 		}
 
 		const update = { $set: { lastPaid: now, nextDue: next, active: !!sched.active, notifiedAt: null } };
 		await scheduledPayments.updateOne({ _id: new ObjectId(id) }, update);
 		const updated = await scheduledPayments.findOne({ _id: new ObjectId(id) });
-		// convertir _id a string en el objeto actualizado antes de emitir
 		const updatedStr = { ...updated, _id: updated._id ? updated._id.toString() : updated._id };
 
-		// emitir eventos
 		io.emit('transaction:created', tx);
 		io.emit('scheduled:paid', { scheduled: updatedStr, transaction: tx });
+
+		// Emitir evento especial si terminó
+		if (ended) {
+			io.emit('scheduled:ended', updatedStr);
+		}
 
 		res.json({ scheduled: updatedStr, transaction: tx });
 	} catch (err) {
@@ -439,6 +444,17 @@ setInterval(async () => {
 			} catch (err) {
 				console.error('Error sending push notifications for scheduled due', err);
 			}
+		}
+
+		// NUEVO: detectar pagos programados que han terminado y emitir evento especial
+		const endedList = await scheduledPayments.find({
+			active: true,
+			endDate: { $ne: null, $lte: now }
+		}).toArray();
+		for (const s of endedList) {
+			await scheduledPayments.updateOne({ _id: s._id }, { $set: { active: false } });
+			const endedObj = { ...s, active: false, _id: s._id.toString() };
+			io.emit('scheduled:ended', endedObj);
 		}
 	} catch (err) {
 		console.error('Error worker scheduled:', err);
