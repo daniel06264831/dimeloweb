@@ -17,12 +17,26 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname))); // sirve index.html y archivos estáticos
 
 // MongoDB connection
-let db, transactions;
+let db, transactions, walletCollection, users, scheduledPayments;
 MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-	.then(client => {
+	.then(async client => {
 		console.log('MongoDB conectado');
 		db = client.db(); // usa la db por defecto del URI
 		transactions = db.collection('transactions');
+		walletCollection = db.collection('wallets');
+		users = db.collection('users');
+		scheduledPayments = db.collection('scheduledPayments');
+
+		// Inicializar documento único de wallet si no existe
+		await walletCollection.updateOne(
+			{ _id: 'singleton' },
+			{ $setOnInsert: { balance: 0, weeklySalary: 0 } },
+			{ upsert: true }
+		);
+
+		// Índices
+		await users.createIndex({ username: 1 }, { unique: true }).catch(()=>{});
+		await scheduledPayments.createIndex({ nextDue: 1 });
 	})
 	.catch(err => console.error('MongoDB error', err));
 
@@ -36,16 +50,45 @@ app.get('/api/transactions', async (req, res) => {
 	}
 });
 
+// NUEVO: registrar usuario
+app.post('/api/users/register', async (req, res) => {
+	try {
+		const { username } = req.body;
+		if (!username || !username.trim()) return res.status(400).json({ error: 'username requerido' });
+		const user = { username: username.trim(), createdAt: new Date() };
+		const result = await users.insertOne(user);
+		user._id = result.insertedId;
+		io.emit('user:registered', user);
+		res.status(201).json(user);
+	} catch (err) {
+		if (err && err.code === 11000) return res.status(409).json({ error: 'username ya existe' });
+		res.status(500).json({ error: 'Error al registrar usuario' });
+	}
+});
+
+// NUEVO: listar usuarios
+app.get('/api/users', async (req, res) => {
+	try {
+		const list = await users.find().sort({ createdAt: 1 }).toArray();
+		res.json(list);
+	} catch (err) {
+		res.status(500).json({ error: 'Error al obtener usuarios' });
+	}
+});
+
+// modificar creación de transacción para incluir usuario
 app.post('/api/transactions', async (req, res) => {
 	try {
-		const { description, amount, type, category } = req.body;
+		const { description, amount, type, category, userId, username } = req.body;
 		if (!description || !amount || !type) return res.status(400).json({ error: 'Datos incompletos' });
 		const tx = {
 			description,
 			amount,
 			type,
 			category: category || 'General',
-			createdAt: new Date()
+			createdAt: new Date(),
+			userId: userId || null,
+			username: username || null
 		};
 		const result = await transactions.insertOne(tx);
 		tx._id = result.insertedId;
@@ -78,6 +121,190 @@ app.delete('/api/transactions', async (req, res) => {
 	}
 });
 
+// Nuevas rutas para billetera y sueldo semanal
+app.get('/api/wallet', async (req, res) => {
+	try {
+		const w = await walletCollection.findOne({ _id: 'singleton' });
+		res.json({ balance: (w && w.balance) || 0, weeklySalary: (w && w.weeklySalary) || 0 });
+	} catch (err) {
+		res.status(500).json({ error: 'Error al obtener la billetera' });
+	}
+});
+
+app.post('/api/wallet/salary', async (req, res) => {
+	try {
+		const { weeklySalary } = req.body;
+		if (weeklySalary == null) return res.status(400).json({ error: 'weeklySalary requerido' });
+
+		await walletCollection.updateOne(
+			{ _id: 'singleton' },
+			{ $set: { weeklySalary: Number(weeklySalary) } },
+			{ upsert: true }
+		);
+
+		const w = await walletCollection.findOne({ _id: 'singleton' });
+		io.emit('wallet:updated', { balance: w.balance, weeklySalary: w.weeklySalary });
+		res.json({ balance: w.balance, weeklySalary: w.weeklySalary });
+	} catch (err) {
+		res.status(500).json({ error: 'Error al configurar sueldo semanal' });
+	}
+});
+
+app.post('/api/wallet/pay', async (req, res) => {
+	try {
+		const w = await walletCollection.findOne({ _id: 'singleton' });
+		const salary = (w && w.weeklySalary) || 0;
+		if (!salary || salary <= 0) return res.status(400).json({ error: 'Sueldo semanal no configurado o es 0' });
+
+		const newBalance = (w.balance || 0) + salary;
+		await walletCollection.updateOne({ _id: 'singleton' }, { $set: { balance: newBalance } });
+
+		// Registrar como transacción de ingreso
+		const tx = {
+			description: 'Sueldo semanal',
+			amount: Number(salary),
+			type: 'income',
+			category: 'Salary',
+			createdAt: new Date()
+		};
+		const result = await transactions.insertOne(tx);
+		tx._id = result.insertedId;
+
+		io.emit('wallet:updated', { balance: newBalance, weeklySalary: salary });
+		io.emit('transaction:created', tx);
+
+		res.json({ balance: newBalance, transaction: tx });
+	} catch (err) {
+		res.status(500).json({ error: 'Error al procesar pago de sueldo' });
+	}
+});
+
+// NUEVO: listar pagos programados
+app.get('/api/scheduled', async (req, res) => {
+	try {
+		const list = await scheduledPayments.find().sort({ nextDue: 1 }).toArray();
+		res.json(list);
+	} catch (err) {
+		res.status(500).json({ error: 'Error al obtener pagos programados' });
+	}
+});
+
+// NUEVO: crear pago programado
+app.post('/api/scheduled', async (req, res) => {
+	try {
+		const { description, amount, frequency, nextDue, endDate, category, userId, username, type } = req.body;
+		if (!description || !amount || !frequency || !nextDue) return res.status(400).json({ error: 'Datos incompletos' });
+
+		const doc = {
+			description,
+			amount: Number(amount),
+			type: type || 'expense', // por defecto gasto
+			frequency, // 'weekly' | 'monthly' | 'once'
+			nextDue: new Date(nextDue),
+			endDate: endDate ? new Date(endDate) : null,
+			category: category || 'General',
+			userId: userId || null,
+			username: username || null,
+			lastPaid: null,
+			notifiedAt: null,
+			active: true,
+			createdAt: new Date()
+		};
+		const result = await scheduledPayments.insertOne(doc);
+		doc._id = result.insertedId;
+		io.emit('scheduled:created', doc);
+		res.status(201).json(doc);
+	} catch (err) {
+		res.status(500).json({ error: 'Error al crear pago programado' });
+	}
+});
+
+// NUEVO: marcar pago programado como pagado
+app.post('/api/scheduled/:id/pay', async (req, res) => {
+	try {
+		const { id } = req.params;
+		const sched = await scheduledPayments.findOne({ _id: new ObjectId(id) });
+		if (!sched) return res.status(404).json({ error: 'Programado no encontrado' });
+
+		// crear transacción asociada
+		const tx = {
+			description: `${sched.description} (pago programado)`,
+			amount: Number(sched.amount),
+			type: sched.type || 'expense',
+			category: sched.category || 'General',
+			createdAt: new Date(),
+			userId: sched.userId || null,
+			username: sched.username || null
+		};
+		const r = await transactions.insertOne(tx);
+		tx._id = r.insertedId;
+
+		// actualizar lastPaid y calcular nextDue según frecuencia
+		const now = new Date();
+		let next = sched.nextDue ? new Date(sched.nextDue) : now;
+		// avanzar una unidad a partir de la fecha actual o nextDue
+		if (sched.frequency === 'weekly') {
+			next = new Date(next.getTime() + 7 * 24 * 60 * 60 * 1000);
+		} else if (sched.frequency === 'monthly') {
+			next = new Date(next);
+			next.setMonth(next.getMonth() + 1);
+		} else {
+			// once -> desactivar
+			sched.active = false;
+			next = null;
+		}
+
+		// si hay endDate y next > endDate -> desactivar
+		if (sched.endDate && next && next > new Date(sched.endDate)) {
+			sched.active = false;
+			next = null;
+		}
+
+		const update = { $set: { lastPaid: now, nextDue: next, active: !!sched.active, notifiedAt: null } };
+		await scheduledPayments.updateOne({ _id: new ObjectId(id) }, update);
+		const updated = await scheduledPayments.findOne({ _id: new ObjectId(id) });
+
+		// emitir eventos
+		io.emit('transaction:created', tx);
+		io.emit('scheduled:paid', { scheduled: updated, transaction: tx });
+
+		res.json({ scheduled: updated, transaction: tx });
+	} catch (err) {
+		res.status(500).json({ error: 'Error al procesar pago programado' });
+	}
+});
+
+// NUEVO: eliminar pago programado
+app.delete('/api/scheduled/:id', async (req, res) => {
+	try {
+		const { id } = req.params;
+		const result = await scheduledPayments.deleteOne({ _id: new ObjectId(id) });
+		if (result.deletedCount === 0) return res.status(404).json({ error: 'No encontrado' });
+		io.emit('scheduled:deleted', { id });
+		res.json({ id });
+	} catch (err) {
+		res.status(500).json({ error: 'Error al eliminar programado' });
+	}
+});
+
+// Worker periódico para detectar vencimientos y emitir notificaciones
+setInterval(async () => {
+	try {
+		if (!scheduledPayments) return;
+		const now = new Date();
+		// seleccionar activos con nextDue <= ahora y que no hayan sido notificados para ese nextDue
+		const dueList = await scheduledPayments.find({ active: true, nextDue: { $lte: now } }).toArray();
+		for (const s of dueList) {
+			// evitar múltiples notificaciones si ya notificado recientemente para la misma nextDue
+			if (s.notifiedAt && new Date(s.notifiedAt) >= new Date(s.nextDue)) continue;
+			await scheduledPayments.updateOne({ _id: s._id }, { $set: { notifiedAt: new Date() } });
+			io.emit('scheduled:due', s);
+		}
+	} catch (err) {
+		console.error('Error worker scheduled:', err);
+	}
+}, 60 * 1000); // cada minuto
+
 // Socket.IO with explicit CORS origin (permitir el cliente alojado en Render)
 const io = new Server(server, {
 	cors: {
@@ -97,3 +324,4 @@ server.listen(PORT, '0.0.0.0', () => {
 	console.log(`Servidor escuchando en puerto ${PORT}`);
 	console.log(`Socket.IO origin permitido: ${RENDER_URL}`);
 });
+
