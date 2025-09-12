@@ -1,7 +1,7 @@
 const path = require('path');
 const http = require('http');
 const express = require('express');
-const mongoose = require('mongoose');
+const { MongoClient, ObjectId } = require('mongodb');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -16,25 +16,20 @@ const RENDER_URL = process.env.RENDER_URL || 'https://dimeloweb.onrender.com';
 app.use(express.json());
 app.use(express.static(path.join(__dirname))); // sirve index.html y archivos estáticos
 
-// Mongoose model
-mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-	.then(() => console.log('MongoDB conectado'))
+// MongoDB connection
+let db, transactions;
+MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+	.then(client => {
+		console.log('MongoDB conectado');
+		db = client.db(); // usa la db por defecto del URI
+		transactions = db.collection('transactions');
+	})
 	.catch(err => console.error('MongoDB error', err));
-
-const transactionSchema = new mongoose.Schema({
-	description: { type: String, required: true },
-	amount: { type: Number, required: true },
-	type: { type: String, enum: ['income', 'expense'], required: true },
-	category: { type: String, default: 'General' },
-	createdAt: { type: Date, default: Date.now }
-});
-
-const Transaction = mongoose.model('Transaction', transactionSchema);
 
 // API
 app.get('/api/transactions', async (req, res) => {
 	try {
-		const txs = await Transaction.find().sort({ createdAt: -1 }).lean();
+		const txs = await transactions.find().sort({ createdAt: -1 }).toArray();
 		res.json(txs);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener transacciones' });
@@ -45,7 +40,15 @@ app.post('/api/transactions', async (req, res) => {
 	try {
 		const { description, amount, type, category } = req.body;
 		if (!description || !amount || !type) return res.status(400).json({ error: 'Datos incompletos' });
-		const tx = await Transaction.create({ description, amount, type, category });
+		const tx = {
+			description,
+			amount,
+			type,
+			category: category || 'General',
+			createdAt: new Date()
+		};
+		const result = await transactions.insertOne(tx);
+		tx._id = result.insertedId;
 		io.emit('transaction:created', tx);
 		res.status(201).json(tx);
 	} catch (err) {
@@ -56,8 +59,8 @@ app.post('/api/transactions', async (req, res) => {
 app.delete('/api/transactions/:id', async (req, res) => {
 	try {
 		const { id } = req.params;
-		const deleted = await Transaction.findByIdAndDelete(id);
-		if (!deleted) return res.status(404).json({ error: 'No encontrado' });
+		const result = await transactions.deleteOne({ _id: new ObjectId(id) });
+		if (result.deletedCount === 0) return res.status(404).json({ error: 'No encontrado' });
 		io.emit('transaction:deleted', { id });
 		res.json({ id });
 	} catch (err) {
@@ -67,7 +70,7 @@ app.delete('/api/transactions/:id', async (req, res) => {
 
 app.delete('/api/transactions', async (req, res) => {
 	try {
-		await Transaction.deleteMany({});
+		await transactions.deleteMany({});
 		io.emit('transactions:cleared');
 		res.json({ cleared: true });
 	} catch (err) {
