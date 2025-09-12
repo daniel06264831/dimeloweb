@@ -3,6 +3,7 @@ const http = require('http');
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const { Server } = require('socket.io');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -22,6 +23,11 @@ app.use((req, res, next) => {
 	if (req.method === 'OPTIONS') return res.sendStatus(200);
 	next();
 });
+// Servir carpeta uploads (fotos)
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+app.use('/uploads', express.static(uploadsDir));
+
 app.use(express.static(path.join(__dirname))); // sirve index.html y archivos estáticos
 
 // MongoDB connection
@@ -65,7 +71,7 @@ app.post('/api/users/register', async (req, res) => {
 	try {
 		const { username } = req.body;
 		if (!username || !username.trim()) return res.status(400).json({ error: 'username requerido' });
-		const user = { username: username.trim(), createdAt: new Date() };
+		const user = { username: username.trim(), createdAt: new Date(), photoUrl: null };
 		const result = await users.insertOne(user);
 		// Asegurar que _id se envía como string
 		user._id = result.insertedId.toString();
@@ -81,11 +87,46 @@ app.post('/api/users/register', async (req, res) => {
 app.get('/api/users', async (req, res) => {
 	try {
 		const list = await users.find().sort({ createdAt: 1 }).toArray();
-		// Convertir _id a string para el cliente
-		const mapped = list.map(u => ({ ...u, _id: u._id ? u._id.toString() : u._id }));
+		// Convertir _id a string para el cliente y garantizar photoUrl existe
+		const mapped = list.map(u => ({ ...u, _id: u._id ? u._id.toString() : u._id, photoUrl: u.photoUrl || null }));
 		res.json(mapped);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener usuarios' });
+	}
+});
+
+// NUEVO: subir foto de perfil (dataUrl en JSON)
+app.post('/api/users/:id/photo', async (req, res) => {
+	try {
+		const { id } = req.params;
+		const { dataUrl } = req.body;
+		if (!dataUrl || typeof dataUrl !== 'string') return res.status(400).json({ error: 'dataUrl requerido' });
+
+		// parse dataUrl: data:[<mediatype>][;base64],<data>
+		const match = dataUrl.match(/^data:(image\/\w+);base64,(.+)$/);
+		if (!match) return res.status(400).json({ error: 'dataUrl no válido' });
+
+		const mime = match[1]; // e.g. image/png
+		const ext = mime.split('/')[1] || 'png';
+		const b64 = match[2];
+		const buf = Buffer.from(b64, 'base64');
+
+		const filename = `user-${id}-${Date.now()}.${ext}`;
+		const filepath = path.join(uploadsDir, filename);
+		fs.writeFileSync(filepath, buf);
+
+		const photoPath = `/uploads/${filename}`;
+
+		// actualizar usuario
+		await users.updateOne({ _id: new ObjectId(id) }, { $set: { photoUrl: photoPath } });
+		const updated = await users.findOne({ _id: new ObjectId(id) });
+		const out = { ...updated, _id: updated._id.toString(), photoUrl: updated.photoUrl || null };
+		// emitir evento para clientes conectados
+		io.emit('user:registered', out);
+		res.json(out);
+	} catch (err) {
+		console.error('upload photo error', err);
+		res.status(500).json({ error: 'Error al subir foto' });
 	}
 });
 
