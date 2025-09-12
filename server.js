@@ -14,6 +14,14 @@ const RENDER_URL = process.env.RENDER_URL || 'https://dimeloweb.onrender.com';
 
 // Middlewares
 app.use(express.json());
+// --- Añadir CORS headers para permitir requests desde file:// o cualquier origen ---
+app.use((req, res, next) => {
+	res.header('Access-Control-Allow-Origin', '*');
+	res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+	res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+	if (req.method === 'OPTIONS') return res.sendStatus(200);
+	next();
+});
 app.use(express.static(path.join(__dirname))); // sirve index.html y archivos estáticos
 
 // MongoDB connection
@@ -44,7 +52,9 @@ MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true
 app.get('/api/transactions', async (req, res) => {
 	try {
 		const txs = await transactions.find().sort({ createdAt: -1 }).toArray();
-		res.json(txs);
+		// convertir _id a string para el cliente
+		const mapped = txs.map(t => ({ ...t, _id: t._id ? t._id.toString() : t._id }));
+		res.json(mapped);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener transacciones' });
 	}
@@ -57,7 +67,8 @@ app.post('/api/users/register', async (req, res) => {
 		if (!username || !username.trim()) return res.status(400).json({ error: 'username requerido' });
 		const user = { username: username.trim(), createdAt: new Date() };
 		const result = await users.insertOne(user);
-		user._id = result.insertedId;
+		// Asegurar que _id se envía como string
+		user._id = result.insertedId.toString();
 		io.emit('user:registered', user);
 		res.status(201).json(user);
 	} catch (err) {
@@ -70,7 +81,9 @@ app.post('/api/users/register', async (req, res) => {
 app.get('/api/users', async (req, res) => {
 	try {
 		const list = await users.find().sort({ createdAt: 1 }).toArray();
-		res.json(list);
+		// Convertir _id a string para el cliente
+		const mapped = list.map(u => ({ ...u, _id: u._id ? u._id.toString() : u._id }));
+		res.json(mapped);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener usuarios' });
 	}
@@ -91,7 +104,7 @@ app.post('/api/transactions', async (req, res) => {
 			username: username || null
 		};
 		const result = await transactions.insertOne(tx);
-		tx._id = result.insertedId;
+		tx._id = result.insertedId.toString();
 		io.emit('transaction:created', tx);
 		res.status(201).json(tx);
 	} catch (err) {
@@ -168,7 +181,7 @@ app.post('/api/wallet/pay', async (req, res) => {
 			createdAt: new Date()
 		};
 		const result = await transactions.insertOne(tx);
-		tx._id = result.insertedId;
+		tx._id = result.insertedId.toString();
 
 		io.emit('wallet:updated', { balance: newBalance, weeklySalary: salary });
 		io.emit('transaction:created', tx);
@@ -183,7 +196,8 @@ app.post('/api/wallet/pay', async (req, res) => {
 app.get('/api/scheduled', async (req, res) => {
 	try {
 		const list = await scheduledPayments.find().sort({ nextDue: 1 }).toArray();
-		res.json(list);
+		const mapped = list.map(s => ({ ...s, _id: s._id ? s._id.toString() : s._id }));
+		res.json(mapped);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener pagos programados' });
 	}
@@ -211,7 +225,7 @@ app.post('/api/scheduled', async (req, res) => {
 			createdAt: new Date()
 		};
 		const result = await scheduledPayments.insertOne(doc);
-		doc._id = result.insertedId;
+		doc._id = result.insertedId.toString();
 		io.emit('scheduled:created', doc);
 		res.status(201).json(doc);
 	} catch (err) {
@@ -237,7 +251,7 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 			username: sched.username || null
 		};
 		const r = await transactions.insertOne(tx);
-		tx._id = r.insertedId;
+		tx._id = r.insertedId.toString();
 
 		// actualizar lastPaid y calcular nextDue según frecuencia
 		const now = new Date();
@@ -263,12 +277,14 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		const update = { $set: { lastPaid: now, nextDue: next, active: !!sched.active, notifiedAt: null } };
 		await scheduledPayments.updateOne({ _id: new ObjectId(id) }, update);
 		const updated = await scheduledPayments.findOne({ _id: new ObjectId(id) });
+		// convertir _id a string en el objeto actualizado antes de emitir
+		const updatedStr = { ...updated, _id: updated._id ? updated._id.toString() : updated._id };
 
 		// emitir eventos
 		io.emit('transaction:created', tx);
-		io.emit('scheduled:paid', { scheduled: updated, transaction: tx });
+		io.emit('scheduled:paid', { scheduled: updatedStr, transaction: tx });
 
-		res.json({ scheduled: updated, transaction: tx });
+		res.json({ scheduled: updatedStr, transaction: tx });
 	} catch (err) {
 		res.status(500).json({ error: 'Error al procesar pago programado' });
 	}
@@ -306,9 +322,10 @@ setInterval(async () => {
 }, 60 * 1000); // cada minuto
 
 // Socket.IO with explicit CORS origin (permitir el cliente alojado en Render)
+// permitir cualquier origin para desarrollo local (puedes ajustar a RENDER_URL en producción)
 const io = new Server(server, {
 	cors: {
-		origin: RENDER_URL,
+		origin: '*',
 		methods: ['GET', 'POST']
 	}
 });
@@ -324,4 +341,3 @@ server.listen(PORT, '0.0.0.0', () => {
 	console.log(`Servidor escuchando en puerto ${PORT}`);
 	console.log(`Socket.IO origin permitido: ${RENDER_URL}`);
 });
-
