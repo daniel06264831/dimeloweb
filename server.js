@@ -4,6 +4,7 @@ const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const { Server } = require('socket.io');
 const fs = require('fs');
+const webpush = require('web-push');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,6 +13,20 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://daniel:daniel25@so.k6u9iol.mongodb.net/?retryWrites=true&w=majority&appName=so&authSource=admin';
 const RENDER_URL = process.env.RENDER_URL || 'https://dimeloweb.onrender.com';
+
+// VAPID keys: se usan las claves proporcionadas directamente (no variables de entorno)
+const VAPID_PUBLIC = "BAVq02xbmcJl5m9IDyYJoewdka1rPwnInvkrAqrrcg6fgjRvjJGwmNUPmGAeOX0FQ0Kc_3H-sXEnQdw5LFrbWbk";
+const VAPID_PRIVATE = "lsumd58Q-P1OiKgSmZzpsVUUW7YRozGHRNeCe_Ua024";
+
+try {
+	webpush.setVapidDetails('mailto:admin@example.com', VAPID_PUBLIC, VAPID_PRIVATE);
+	console.log('web-push VAPID configuradas con claves embebidas.');
+} catch (e) {
+	console.warn('Error configurando VAPID en web-push', e);
+}
+
+// Collection para push subscriptions
+let pushSubscriptionsCollection = null;
 
 // Middlewares
 app.use(express.json());
@@ -40,6 +55,7 @@ MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true
 		walletCollection = db.collection('wallets');
 		users = db.collection('users');
 		scheduledPayments = db.collection('scheduledPayments');
+		pushSubscriptionsCollection = db.collection('pushSubscriptions');
 
 		// Inicializar documento único de wallet si no existe
 		await walletCollection.updateOne(
@@ -51,6 +67,7 @@ MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true
 		// Índices
 		await users.createIndex({ username: 1 }, { unique: true }).catch(()=>{});
 		await scheduledPayments.createIndex({ nextDue: 1 });
+		await pushSubscriptionsCollection.createIndex({ endpoint: 1 }, { unique: true }).catch(()=>{});
 	})
 	.catch(err => console.error('MongoDB error', err));
 
@@ -344,6 +361,41 @@ app.delete('/api/scheduled/:id', async (req, res) => {
 	}
 });
 
+/* NUEVOS endpoints para Push */
+// devolver VAPID public key (en base64)
+app.get('/api/push/vapidPublicKey', (req, res) => {
+	if (!VAPID_PUBLIC) return res.status(500).json({ error: 'VAPID key not configured' });
+	res.json({ key: VAPID_PUBLIC });
+});
+
+// registrar suscripción push (body: { subscription, userId })
+app.post('/api/push/subscribe', async (req, res) => {
+	try {
+		const { subscription, userId } = req.body;
+		if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' });
+		const doc = { endpoint: subscription.endpoint, subscription, userId: userId || null, createdAt: new Date() };
+		// upsert por endpoint
+		await pushSubscriptionsCollection.updateOne({ endpoint: doc.endpoint }, { $set: doc }, { upsert: true });
+		res.json({ ok: true });
+	} catch (err) {
+		console.error('push subscribe error', err);
+		res.status(500).json({ error: 'Error saving subscription' });
+	}
+});
+
+// eliminar suscripción (body: { endpoint })
+app.post('/api/push/unsubscribe', async (req, res) => {
+	try {
+		const { endpoint } = req.body;
+		if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+		await pushSubscriptionsCollection.deleteOne({ endpoint });
+		res.json({ ok: true });
+	} catch (err) {
+		console.error('push unsubscribe error', err);
+		res.status(500).json({ error: 'Error removing subscription' });
+	}
+});
+
 // Worker periódico para detectar vencimientos y emitir notificaciones
 setInterval(async () => {
 	try {
@@ -356,6 +408,37 @@ setInterval(async () => {
 			if (s.notifiedAt && new Date(s.notifiedAt) >= new Date(s.nextDue)) continue;
 			await scheduledPayments.updateOne({ _id: s._id }, { $set: { notifiedAt: new Date() } });
 			io.emit('scheduled:due', s);
+
+			// NUEVO: enviar push a suscripciones asociadas al usuario del programado (si existe)
+			try {
+				if (pushSubscriptionsCollection) {
+					let subs = [];
+					if (s.userId) {
+						subs = await pushSubscriptionsCollection.find({ userId: String(s.userId) }).toArray();
+					}
+					// si no hay subs para el usuario, opcional: notificar a todas las subs (comentar/activar según necesidad)
+					// if (subs.length === 0) subs = await pushSubscriptionsCollection.find().toArray();
+
+					const payload = {
+						title: 'Pago programado por vencer',
+						body: `${s.description} — ${s.amount ? (Number(s.amount).toFixed(2) + ' EUR') : ''} vence hoy.`,
+						url: '/', // puede ajustarse a una ruta que muestre pagos programados
+						tag: `scheduled-${s._id ? s._id.toString() : Date.now()}`
+					};
+
+					for (const p of subs) {
+						try {
+							await webpush.sendNotification(p.subscription, JSON.stringify(payload));
+						} catch (err) {
+							// si la suscripción ya no es válida, eliminarla
+							console.warn('webpush send error, removing subscription', err);
+							try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){/*ignore*/ }
+						}
+					}
+				}
+			} catch (err) {
+				console.error('Error sending push notifications for scheduled due', err);
+			}
 		}
 	} catch (err) {
 		console.error('Error worker scheduled:', err);
