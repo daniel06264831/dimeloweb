@@ -32,9 +32,22 @@ let pushSubscriptionsCollection = null;
 app.use(express.json());
 // --- Añadir CORS headers para permitir requests desde file:// o cualquier origen ---
 app.use((req, res, next) => {
-	res.header('Access-Control-Allow-Origin', '*');
+	const allowedOrigins = [
+		'https://control-lovat.vercel.app',
+		'https://dimeloweb.onrender.com',
+		'http://localhost:3000',
+		'http://127.0.0.1:3000'
+	];
+	const origin = req.headers.origin;
+	if (allowedOrigins.includes(origin)) {
+		res.header('Access-Control-Allow-Origin', origin);
+	} else {
+		res.header('Access-Control-Allow-Origin', '*');
+	}
 	res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
 	res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+	// Si usas cookies, añade:
+	// res.header('Access-Control-Allow-Credentials', 'true');
 	if (req.method === 'OPTIONS') return res.sendStatus(200);
 	next();
 });
@@ -46,7 +59,7 @@ app.use('/uploads', express.static(uploadsDir));
 app.use(express.static(path.join(__dirname))); // sirve index.html y archivos estáticos
 
 // MongoDB connection
-let db, transactions, walletCollection, users, scheduledPayments;
+let db, transactions, walletCollection, users, scheduledPayments, messages;
 MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
 	.then(async client => {
 		console.log('MongoDB conectado');
@@ -56,6 +69,9 @@ MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true
 		users = db.collection('users');
 		scheduledPayments = db.collection('scheduledPayments');
 		pushSubscriptionsCollection = db.collection('pushSubscriptions');
+
+		// NUEVO: colección de mensajes
+		messages = db.collection('messages');
 
 		// Inicializar documento único de wallet si no existe
 		await walletCollection.updateOne(
@@ -68,6 +84,8 @@ MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true
 		await users.createIndex({ username: 1 }, { unique: true }).catch(()=>{});
 		await scheduledPayments.createIndex({ nextDue: 1 });
 		await pushSubscriptionsCollection.createIndex({ endpoint: 1 }, { unique: true }).catch(()=>{});
+		// índice para mensajes por fecha
+		await messages.createIndex({ createdAt: 1 }).catch(()=>{});
 	})
 	.catch(err => console.error('MongoDB error', err));
 
@@ -456,9 +474,99 @@ app.post('/api/push/unsubscribe', async (req, res) => {
 	}
 });
 
+// NUEVO: endpoint para enviar notificación de mensaje al user destino
+app.post('/api/push/sendMessage', async (req, res) => {
+	try {
+		const { toUserId, title, body, data, tag } = req.body;
+		if (!toUserId) return res.status(400).json({ error: 'toUserId required' });
+		if (!pushSubscriptionsCollection) return res.status(500).json({ error: 'Push collection not ready' });
+
+		const subs = await pushSubscriptionsCollection.find({ userId: String(toUserId) }).toArray();
+		if (!subs || subs.length === 0) return res.json({ sent: 0, note: 'no subscriptions for user' });
+
+		const payload = {
+			title: title || 'Nuevo mensaje',
+			body: body || '',
+			url: (data && data.url) || '/',
+			tag: tag || `msg-${Date.now()}`
+		};
+
+		let sent = 0;
+		for (const p of subs) {
+			try {
+				await webpush.sendNotification(p.subscription, JSON.stringify(payload));
+				sent++;
+			} catch (err) {
+				console.warn('webpush send error, removing subscription', err);
+				try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){/*ignore*/ }
+			}
+		}
+		res.json({ sent });
+	} catch (err) {
+		console.error('Error in sendMessage push', err);
+		res.status(500).json({ error: 'Error sending message pushes' });
+	}
+});
+
 // NUEVO: endpoint para "despertar" el servidor o comprobar estado
 app.get('/api/ping', (req, res) => {
 	res.status(200).json({ pong: true, ts: Date.now() });
+});
+
+// --- Añadir endpoints de mensajes ---
+// Obtener historial entre dos usuarios (user1 y user2)
+app.get('/api/messages', async (req, res) => {
+	try {
+		const { user1, user2 } = req.query;
+		if (!user1 || !user2) return res.status(400).json({ error: 'user1 y user2 requeridos' });
+
+		const q = {
+			$or: [
+				{ fromUserId: String(user1), toUserId: String(user2) },
+				{ fromUserId: String(user2), toUserId: String(user1) }
+			]
+		};
+		const list = await messages.find(q).sort({ createdAt: 1 }).toArray();
+		const mapped = list.map(m => ({ ...m, _id: m._id ? m._id.toString() : m._id }));
+		res.json(mapped);
+	} catch (err) {
+		console.error('GET /api/messages error', err);
+		res.status(500).json({ error: 'Error al obtener mensajes' });
+	}
+});
+
+// Crear y enviar mensaje
+app.post('/api/messages', async (req, res) => {
+	try {
+		const { fromUserId, toUserId, text } = req.body;
+		if (!fromUserId || !toUserId || !text) return res.status(400).json({ error: 'fromUserId, toUserId y text requeridos' });
+
+		const msg = {
+			fromUserId: String(fromUserId),
+			toUserId: String(toUserId),
+			text: String(text),
+			createdAt: new Date()
+		};
+		const result = await messages.insertOne(msg);
+		msg._id = result.insertedId.toString();
+
+		// Emitir solo a las rooms de remitente y destinatario (siempre que io exista)
+		try {
+			if (typeof io !== 'undefined' && io) {
+				io.to(String(toUserId)).emit('message:created', msg);
+				io.to(String(fromUserId)).emit('message:created', msg);
+				// fallback global emit (opcional)
+				io.emit('message:created', msg);
+			}
+		} catch (e) {
+			console.warn('emit message error', e);
+		}
+
+		res.status(201).json(msg);
+	} catch (err) {
+		console.error('POST /api/messages error', err);
+		res.status(500).json({ error: 'Error al crear mensaje' });
+	}
 });
 
 // Worker periódico para detectar vencimientos y emitir notificaciones
@@ -530,9 +638,20 @@ const io = new Server(server, {
 	}
 });
 
-// Socket.IO logging
+// Socket.IO logging + allow sockets to join room by userId
 io.on('connection', socket => {
 	console.log('socket conectado', socket.id);
+
+	socket.on('user:join', userId => {
+		try {
+			if (!userId) return;
+			socket.join(String(userId));
+			console.log('socket', socket.id, 'joined user room', String(userId));
+		} catch(e){ console.warn(e); }
+	});
+	socket.on('user:leave', userId => {
+		try { if (userId) socket.leave(String(userId)); } catch(e){}
+	});
 	socket.on('disconnect', () => console.log('socket desconectado', socket.id));
 });
 
