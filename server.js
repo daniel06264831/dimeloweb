@@ -560,7 +560,7 @@ app.post('/api/push/sendMessage', async (req, res) => {
 				sent++;
 			} catch (err) {
 				console.warn('webpush send error, removing subscription', err);
-				try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){/*ignore*/ }
+				try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){ /*ignore*/ }
 			}
 		}
 		res.json({ sent });
@@ -728,6 +728,8 @@ setInterval(async () => {
 
 // Socket.IO with explicit CORS origin (permitir el cliente alojado en Render)
 // permitir cualquier origin para desarrollo local (puedes ajustar a RENDER_URL en producción)
+const userPresence = {}; // { userId: { online: true, lastSeen: Date, typingTo: userId|null } }
+
 const io = new Server(server, {
 	cors: {
 		origin: '*',
@@ -735,21 +737,61 @@ const io = new Server(server, {
 	}
 });
 
-// Socket.IO logging + allow sockets to join room by userId
 io.on('connection', socket => {
 	console.log('socket conectado', socket.id);
+
+	let currentUserId = null;
 
 	socket.on('user:join', userId => {
 		try {
 			if (!userId) return;
-			socket.join(String(userId));
-			console.log('socket', socket.id, 'joined user room', String(userId));
+			currentUserId = String(userId);
+			socket.join(currentUserId);
+			userPresence[currentUserId] = userPresence[currentUserId] || {};
+			userPresence[currentUserId].online = true;
+			userPresence[currentUserId].lastSeen = new Date();
+			userPresence[currentUserId].typingTo = null;
+			io.emit('presence:update', { userId: currentUserId, online: true, lastSeen: userPresence[currentUserId].lastSeen });
+			console.log('socket', socket.id, 'joined user room', currentUserId);
 		} catch(e){ console.warn(e); }
 	});
+
 	socket.on('user:leave', userId => {
-		try { if (userId) socket.leave(String(userId)); } catch(e){}
+		try {
+			if (!userId) return;
+			socket.leave(String(userId));
+			if (userPresence[userId]) {
+				userPresence[userId].online = false;
+				userPresence[userId].lastSeen = new Date();
+				userPresence[userId].typingTo = null;
+				io.emit('presence:update', { userId, online: false, lastSeen: userPresence[userId].lastSeen });
+			}
+		} catch(e){}
 	});
-	socket.on('disconnect', () => console.log('socket desconectado', socket.id));
+
+	socket.on('typing', ({ fromUserId, toUserId, typing }) => {
+		if (!fromUserId || !toUserId) return;
+		userPresence[fromUserId] = userPresence[fromUserId] || {};
+		userPresence[fromUserId].typingTo = typing ? toUserId : null;
+		io.to(String(toUserId)).emit('typing', { fromUserId, typing });
+	});
+
+	socket.on('message:read', ({ fromUserId, toUserId, messageId }) => {
+		// Notifica al remitente que el mensaje fue leído
+		if (fromUserId && toUserId && messageId) {
+			io.to(String(fromUserId)).emit('message:read', { fromUserId, toUserId, messageId });
+		}
+	});
+
+	socket.on('disconnect', () => {
+		if (currentUserId) {
+			userPresence[currentUserId].online = false;
+			userPresence[currentUserId].lastSeen = new Date();
+			userPresence[currentUserId].typingTo = null;
+			io.emit('presence:update', { userId: currentUserId, online: false, lastSeen: userPresence[currentUserId].lastSeen });
+		}
+		console.log('socket desconectado', socket.id);
+	});
 });
 
 // Start - escuchar en todas las interfaces (0.0.0.0) para entornos cloud
