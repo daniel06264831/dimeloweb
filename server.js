@@ -164,6 +164,34 @@ app.post('/api/transactions', async (req, res) => {
 		const result = await transactions.insertOne(tx);
 		tx._id = result.insertedId.toString();
 		io.emit('transaction:created', tx);
+
+		// --- NUEVO: Notificación push al crear gasto/ingreso ---
+		try {
+			if (pushSubscriptionsCollection) {
+				let subs = [];
+				if (userId) {
+					subs = await pushSubscriptionsCollection.find({ userId: String(userId) }).toArray();
+				}
+				if (subs.length === 0) subs = await pushSubscriptionsCollection.find().toArray();
+				const payload = {
+					title: type === 'income' ? 'Nuevo ingreso' : 'Nuevo gasto',
+					body: `${description} — ${Number(amount).toFixed(2)} EUR`,
+					url: '/',
+					tag: `transaction-${tx._id}`
+				};
+				for (const p of subs) {
+					try {
+						await webpush.sendNotification(p.subscription, JSON.stringify(payload));
+					} catch (err) {
+						try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){}
+					}
+				}
+			}
+		} catch (err) {
+			console.error('Error sending push for transaction', err);
+		}
+		// --- FIN NUEVO ---
+
 		res.status(201).json(tx);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al crear transacción' });
@@ -341,6 +369,33 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 
 		io.emit('transaction:created', tx);
 		io.emit('scheduled:paid', { scheduled: updatedStr, transaction: tx });
+
+		// --- NUEVO: Notificación push al pagar pago programado ---
+		try {
+			if (pushSubscriptionsCollection) {
+				let subs = [];
+				if (sched.userId) {
+					subs = await pushSubscriptionsCollection.find({ userId: String(sched.userId) }).toArray();
+				}
+				if (subs.length === 0) subs = await pushSubscriptionsCollection.find().toArray();
+				const payload = {
+					title: 'Pago programado realizado',
+					body: `${sched.description} — ${Number(sched.amount).toFixed(2)} EUR`,
+					url: '/',
+					tag: `scheduled-paid-${sched._id}`
+				};
+				for (const p of subs) {
+					try {
+						await webpush.sendNotification(p.subscription, JSON.stringify(payload));
+					} catch (err) {
+						try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){}
+					}
+				}
+			}
+		} catch (err) {
+			console.error('Error sending push for scheduled pay', err);
+		}
+		// --- FIN NUEVO ---
 
 		// Emitir evento especial si terminó
 		if (ended) {
