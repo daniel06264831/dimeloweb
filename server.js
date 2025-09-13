@@ -562,6 +562,41 @@ app.post('/api/messages', async (req, res) => {
 			console.warn('emit message error', e);
 		}
 
+		// ENVIAR PUSH a suscripciones del usuario destino (si existen)
+		(async function sendPushForMessage() {
+			try {
+				if (!pushSubscriptionsCollection) return;
+				const subs = await pushSubscriptionsCollection.find({ userId: String(toUserId) }).toArray();
+				if (!subs || subs.length === 0) return;
+
+				// Intentar obtener nombre del remitente para mostrar en la notificación
+				let senderName = 'Nuevo mensaje';
+				try {
+					const u = await users.findOne({ _id: new ObjectId(fromUserId) });
+					if (u && u.username) senderName = u.username;
+				} catch(e){ /* puede que fromUserId no sea ObjectId válido, ignorar */ }
+
+				const payload = {
+					title: senderName,
+					body: text.length > 120 ? text.slice(0, 117) + '...' : text,
+					url: '/', // ajustar si se desea abrir ruta específica
+					tag: `msg-${msg._id}`
+				};
+
+				for (const p of subs) {
+					try {
+						await webpush.sendNotification(p.subscription, JSON.stringify(payload));
+					} catch (err) {
+						// si la suscripción ya no es válida, eliminarla
+						console.warn('webpush send error for message, removing subscription', err);
+						try { await pushSubscriptionsCollection.deleteOne({ endpoint: p.endpoint }); } catch(e){ /* ignore */ }
+					}
+				}
+			} catch (err) {
+				console.error('Error sending push for message', err);
+			}
+		})();
+
 		res.status(201).json(msg);
 	} catch (err) {
 		console.error('POST /api/messages error', err);
@@ -660,4 +695,3 @@ server.listen(PORT, '0.0.0.0', () => {
 	console.log(`Servidor escuchando en puerto ${PORT}`);
 	console.log(`Socket.IO origin permitido: ${RENDER_URL}`);
 });
-
