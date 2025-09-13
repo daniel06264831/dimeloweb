@@ -1,4 +1,3 @@
-
 const path = require('path');
 const http = require('http');
 const express = require('express');
@@ -406,23 +405,14 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		const r = await transactions.insertOne(tx);
 		tx._id = r.insertedId.toString();
 
+		// calcular siguiente fecha según frecuencia
 		const now = new Date();
 		let next = sched.nextDue ? new Date(sched.nextDue) : now;
-		// avanzar una unidad a partir de la fecha actual o nextDue
-		if (sched.frequency === 'weekly') {
-			next = new Date(next.getTime() + 7 * 24 * 60 * 60 * 1000);
-		} else if (sched.frequency === 'biweekly') {
-			next = new Date(next.getTime() + 14 * 24 * 60 * 60 * 1000);
-		} else if (sched.frequency === 'monthly') {
-			next = new Date(next);
-			next.setMonth(next.getMonth() + 1);
-		} else {
-			// once -> desactivar
-			sched.active = false;
-			next = null;
-		}
+		if (sched.frequency === 'weekly') next = new Date(next.getTime() + 7 * 24 * 60 * 60 * 1000);
+		else if (sched.frequency === 'biweekly') next = new Date(next.getTime() + 14 * 24 * 60 * 60 * 1000);
+		else if (sched.frequency === 'monthly') { next = new Date(next); next.setMonth(next.getMonth() + 1); }
+		else { sched.active = false; next = null; } // once -> desactivar
 
-		// si hay endDate y next > endDate -> desactivar
 		let ended = false;
 		if (sched.endDate && next && next > new Date(sched.endDate)) {
 			sched.active = false;
@@ -435,10 +425,31 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		const updated = await scheduledPayments.findOne({ _id: new ObjectId(id) });
 		const updatedStr = { ...updated, _id: updated._id ? updated._id.toString() : updated._id };
 
-		io.emit('transaction:created', tx);
-		io.emit('scheduled:paid', { scheduled: updatedStr, transaction: tx });
+		// Emitir la transacción y el evento programado a TODOS los clientes
+		// (io.emit es global; usar io.sockets.emit por redundancia en algunos entornos)
+		try {
+			io.emit('transaction:created', tx);
+			if (io && io.sockets && typeof io.sockets.emit === 'function') {
+				io.sockets.emit('transaction:created', tx);
+			}
+			io.emit('scheduled:paid', { scheduled: updatedStr, transaction: tx });
+		} catch (e) {
+			console.warn('emit scheduled pay events failed', e);
+		}
 
-		// --- NUEVO: Notificación push al pagar pago programado ---
+		// Recalcular y emitir wallet actualizado a todos
+		try {
+			const balance = await computeBalanceFromTransactions();
+			const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
+			io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
+			if (io && io.sockets && typeof io.sockets.emit === 'function') {
+				io.sockets.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
+			}
+		} catch (e) {
+			console.warn('emit wallet after scheduled pay failed', e);
+		}
+
+		// --- Notificaciones push al pagar programado (mantener) ---
 		try {
 			if (pushSubscriptionsCollection) {
 				let subs = [];
@@ -470,13 +481,9 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 			io.emit('scheduled:ended', updatedStr);
 		}
 
-		// emitir wallet recalculado:
-		const balance = await computeBalanceFromTransactions();
-		const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
-		io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
-
 		res.json({ scheduled: updatedStr, transaction: tx });
 	} catch (err) {
+		console.error('Error en /api/scheduled/:id/pay', err);
 		res.status(500).json({ error: 'Error al procesar pago programado' });
 	}
 });
