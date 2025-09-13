@@ -401,6 +401,11 @@ app.post('/api/push/unsubscribe', async (req, res) => {
 	}
 });
 
+// NUEVO: endpoint para "despertar" el servidor o comprobar estado
+app.get('/api/ping', (req, res) => {
+	res.status(200).json({ pong: true, ts: Date.now() });
+});
+
 // Worker periódico para detectar vencimientos y emitir notificaciones
 setInterval(async () => {
 	try {
