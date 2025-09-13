@@ -1,3 +1,4 @@
+
 const path = require('path');
 const http = require('http');
 const express = require('express');
@@ -89,6 +90,29 @@ MongoClient.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true
 	})
 	.catch(err => console.error('MongoDB error', err));
 
+// helper: calcular balance actual a partir de transacciones (ingresos - gastos)
+async function computeBalanceFromTransactions() {
+	try {
+		if (!transactions) return 0;
+		const agg = await transactions.aggregate([
+			{
+				$group: {
+					_id: null,
+					income: { $sum: { $cond: [{ $eq: ['$type', 'income'] }, '$amount', 0] } },
+					expense: { $sum: { $cond: [{ $eq: ['$type', 'expense'] }, '$amount', 0] } }
+				}
+			}
+		]).toArray();
+		const row = agg && agg[0] ? agg[0] : { income: 0, expense: 0 };
+		const income = Number(row.income || 0);
+		const expense = Number(row.expense || 0);
+		return income - expense;
+	} catch (e) {
+		console.warn('computeBalanceFromTransactions error', e);
+		return 0;
+	}
+}
+
 // API
 app.get('/api/transactions', async (req, res) => {
 	try {
@@ -165,7 +189,7 @@ app.post('/api/users/:id/photo', async (req, res) => {
 	}
 });
 
-// modificar creación de transacción para incluir usuario
+// modificar creación de transacción para incluir usuario y emitir wallet:updated
 app.post('/api/transactions', async (req, res) => {
 	try {
 		const { description, amount, type, category, userId, username } = req.body;
@@ -182,6 +206,13 @@ app.post('/api/transactions', async (req, res) => {
 		const result = await transactions.insertOne(tx);
 		tx._id = result.insertedId.toString();
 		io.emit('transaction:created', tx);
+
+		// emitir wallet actualizado calculado desde transacciones
+		try {
+			const balance = await computeBalanceFromTransactions();
+			const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
+			io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
+		} catch (err) { console.warn('emit wallet after tx create', err); }
 
 		// --- NUEVO: Notificación push al crear gasto/ingreso ---
 		try {
@@ -222,6 +253,14 @@ app.delete('/api/transactions/:id', async (req, res) => {
 		const result = await transactions.deleteOne({ _id: new ObjectId(id) });
 		if (result.deletedCount === 0) return res.status(404).json({ error: 'No encontrado' });
 		io.emit('transaction:deleted', { id });
+
+		// emitir wallet actualizado calculado desde transacciones
+		try {
+			const balance = await computeBalanceFromTransactions();
+			const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
+			io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
+		} catch (err) { console.warn('emit wallet after tx delete', err); }
+
 		res.json({ id });
 	} catch (err) {
 		res.status(500).json({ error: 'Error al borrar transacción' });
@@ -232,6 +271,14 @@ app.delete('/api/transactions', async (req, res) => {
 	try {
 		await transactions.deleteMany({});
 		io.emit('transactions:cleared');
+
+		// emitir wallet actualizado calculado desde transacciones (ahora 0)
+		try {
+			const balance = await computeBalanceFromTransactions();
+			const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
+			io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
+		} catch (err) { console.warn('emit wallet after clear', err); }
+
 		res.json({ cleared: true });
 	} catch (err) {
 		res.status(500).json({ error: 'Error al borrar todas las transacciones' });
@@ -242,7 +289,9 @@ app.delete('/api/transactions', async (req, res) => {
 app.get('/api/wallet', async (req, res) => {
 	try {
 		const w = await walletCollection.findOne({ _id: 'singleton' });
-		res.json({ balance: (w && w.balance) || 0, weeklySalary: (w && w.weeklySalary) || 0 });
+		const weeklySalary = (w && typeof w.weeklySalary !== 'undefined') ? w.weeklySalary : 0;
+		const balance = await computeBalanceFromTransactions();
+		res.json({ balance: balance, weeklySalary: weeklySalary });
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener la billetera' });
 	}
@@ -259,9 +308,11 @@ app.post('/api/wallet/salary', async (req, res) => {
 			{ upsert: true }
 		);
 
-		const w = await walletCollection.findOne({ _id: 'singleton' });
-		io.emit('wallet:updated', { balance: w.balance, weeklySalary: w.weeklySalary });
-		res.json({ balance: w.balance, weeklySalary: w.weeklySalary });
+		const balance = await computeBalanceFromTransactions();
+		const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
+		io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
+
+		res.json({ balance: balance, weeklySalary: (w.weeklySalary || 0) });
 	} catch (err) {
 		res.status(500).json({ error: 'Error al configurar sueldo semanal' });
 	}
@@ -269,12 +320,9 @@ app.post('/api/wallet/salary', async (req, res) => {
 
 app.post('/api/wallet/pay', async (req, res) => {
 	try {
-		const w = await walletCollection.findOne({ _id: 'singleton' });
+		const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
 		const salary = (w && w.weeklySalary) || 0;
 		if (!salary || salary <= 0) return res.status(400).json({ error: 'Sueldo semanal no configurado o es 0' });
-
-		const newBalance = (w.balance || 0) + salary;
-		await walletCollection.updateOne({ _id: 'singleton' }, { $set: { balance: newBalance } });
 
 		// Registrar como transacción de ingreso
 		const tx = {
@@ -287,10 +335,12 @@ app.post('/api/wallet/pay', async (req, res) => {
 		const result = await transactions.insertOne(tx);
 		tx._id = result.insertedId.toString();
 
-		io.emit('wallet:updated', { balance: newBalance, weeklySalary: salary });
+		// Calcular balance desde transacciones y emitir
+		const balance = await computeBalanceFromTransactions();
+		io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
 		io.emit('transaction:created', tx);
 
-		res.json({ balance: newBalance, transaction: tx });
+		res.json({ balance: balance, transaction: tx });
 	} catch (err) {
 		res.status(500).json({ error: 'Error al procesar pago de sueldo' });
 	}
@@ -419,6 +469,11 @@ app.post('/api/scheduled/:id/pay', async (req, res) => {
 		if (ended) {
 			io.emit('scheduled:ended', updatedStr);
 		}
+
+		// emitir wallet recalculado:
+		const balance = await computeBalanceFromTransactions();
+		const w = await walletCollection.findOne({ _id: 'singleton' }) || {};
+		io.emit('wallet:updated', { balance, weeklySalary: (w.weeklySalary || 0) });
 
 		res.json({ scheduled: updatedStr, transaction: tx });
 	} catch (err) {
