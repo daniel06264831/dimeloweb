@@ -617,7 +617,7 @@ app.post('/api/messages', async (req, res) => {
 			if (typeof io !== 'undefined' && io) {
 				io.to(String(toUserId)).emit('message:created', msg);
 				io.to(String(fromUserId)).emit('message:created', msg);
-				// fallback global emit (opcional)
+				// fallback global (opcional)
 				io.emit('message:created', msg);
 			}
 		} catch (e) {
@@ -663,6 +663,47 @@ app.post('/api/messages', async (req, res) => {
 	} catch (err) {
 		console.error('POST /api/messages error', err);
 		res.status(500).json({ error: 'Error al crear mensaje' });
+	}
+});
+
+// Añadir endpoint DELETE para mensajes
+app.delete('/api/messages/:id', async (req, res) => {
+	try {
+		const { id } = req.params;
+		if (!id) return res.status(400).json({ error: 'id requerido' });
+
+		// intentar obtener el mensaje para conocer remitente/destino
+		let msg;
+		try {
+			msg = await messages.findOne({ _id: new ObjectId(id) });
+		} catch (e) {
+			// id no es ObjectId válido
+			return res.status(400).json({ error: 'id no válido' });
+		}
+		if (!msg) return res.status(404).json({ error: 'Mensaje no encontrado' });
+
+		// borrar el mensaje
+		const result = await messages.deleteOne({ _id: new ObjectId(id) });
+		if (result.deletedCount === 0) return res.status(404).json({ error: 'No encontrado' });
+
+		// emitir evento solo a las rooms relevantes (remitente y destinatario) y fallback global
+		try {
+			const fromId = msg.fromUserId ? String(msg.fromUserId) : null;
+			const toId = msg.toUserId ? String(msg.toUserId) : null;
+			const payload = { messageId: id, fromUserId: fromId, toUserId: toId };
+
+			if (fromId) io.to(fromId).emit('message:deleted', payload);
+			if (toId && toId !== fromId) io.to(toId).emit('message:deleted', payload);
+			// fallback global para clientes que no están en rooms
+			io.emit('message:deleted', payload);
+		} catch (e) {
+			console.warn('emit message:deleted failed', e);
+		}
+
+		res.json({ id });
+	} catch (err) {
+		console.error('DELETE /api/messages/:id error', err);
+		res.status(500).json({ error: 'Error al eliminar mensaje' });
 	}
 });
 
