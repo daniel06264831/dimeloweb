@@ -1,3 +1,4 @@
+
 self.addEventListener('push', function(event) {
 	let data = {};
 	try { data = event.data ? event.data.json() : {}; } catch(e){ data = {}; }
@@ -18,9 +19,9 @@ self.addEventListener('notificationclick', function(event) {
 	const url = (event.notification && event.notification.data && event.notification.data.url) || '/';
 	event.waitUntil(
 		clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windowClients => {
+			// Si ya hay una ventana abierta, enfócala, si no, abre una nueva
 			for (let client of windowClients) {
 				if (client.url && 'focus' in client) {
-					client.postMessage({ type: 'navigate', url });
 					return client.focus();
 				}
 			}
