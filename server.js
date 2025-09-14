@@ -29,7 +29,8 @@ try {
 let pushSubscriptionsCollection = null;
 
 // Middlewares
-app.use(express.json());
+// permitir bodies grandes (dataURLs) para subir imágenes grandes
+app.use(express.json({ limit: '50mb' }));
 // --- Añadir CORS headers para permitir requests desde file:// o cualquier origen ---
 app.use((req, res, next) => {
 	const allowedOrigins = [
