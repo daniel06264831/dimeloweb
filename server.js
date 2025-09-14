@@ -145,15 +145,24 @@ app.post('/api/users/register', async (req, res) => {
 app.get('/api/users', async (req, res) => {
 	try {
 		const list = await users.find().sort({ createdAt: 1 }).toArray();
-		// Convertir _id a string para el cliente y garantizar photoUrl existe
-		const mapped = list.map(u => ({ ...u, _id: u._id ? u._id.toString() : u._id, photoUrl: u.photoUrl || null }));
+		// Convertir _id a string y establecer photoUrl si hay foto en BD o en fs
+		const mapped = list.map(u => {
+			const idStr = u._id ? u._id.toString() : u._id;
+			let photoUrl = null;
+			if (u.photoBase64 && u.photoMime) {
+				photoUrl = `/api/users/${idStr}/photo`;
+			} else if (u.photoUrl) {
+				photoUrl = u.photoUrl;
+			}
+			return ({ ...u, _id: idStr, photoUrl });
+		});
 		res.json(mapped);
 	} catch (err) {
 		res.status(500).json({ error: 'Error al obtener usuarios' });
 	}
 });
 
-// NUEVO: subir foto de perfil (dataUrl en JSON)
+// NUEVO: subir foto de perfil (dataUrl en JSON) - almacenar en MongoDB en lugar del filesystem
 app.post('/api/users/:id/photo', async (req, res) => {
 	try {
 		const { id } = req.params;
@@ -165,26 +174,66 @@ app.post('/api/users/:id/photo', async (req, res) => {
 		if (!match) return res.status(400).json({ error: 'dataUrl no válido' });
 
 		const mime = match[1]; // e.g. image/png
-		const ext = mime.split('/')[1] || 'png';
 		const b64 = match[2];
-		const buf = Buffer.from(b64, 'base64');
 
-		const filename = `user-${id}-${Date.now()}.${ext}`;
-		const filepath = path.join(uploadsDir, filename);
-		fs.writeFileSync(filepath, buf);
+		// Guardar en la colección users: photoMime + photoBase64
+		try {
+			await users.updateOne(
+				{ _id: new ObjectId(id) },
+				{ $set: { photoMime: mime, photoBase64: b64, photoUrl: `/api/users/${id}/photo` } }
+			);
+		} catch (e) {
+			// si id no es ObjectId válido o no existe, devolver error
+			return res.status(400).json({ error: 'user id no válido o no existe' });
+		}
 
-		const photoPath = `/uploads/${filename}`;
-
-		// actualizar usuario
-		await users.updateOne({ _id: new ObjectId(id) }, { $set: { photoUrl: photoPath } });
 		const updated = await users.findOne({ _id: new ObjectId(id) });
 		const out = { ...updated, _id: updated._id.toString(), photoUrl: updated.photoUrl || null };
-		// emitir evento para clientes conectados
 		io.emit('user:registered', out);
 		res.json(out);
 	} catch (err) {
 		console.error('upload photo error', err);
 		res.status(500).json({ error: 'Error al subir foto' });
+	}
+});
+
+// NUEVO: servir foto del usuario desde MongoDB (persistente aunque el servidor se reinicie)
+app.get('/api/users/:id/photo', async (req, res) => {
+	try {
+		const { id } = req.params;
+		let u;
+		try {
+			u = await users.findOne({ _id: new ObjectId(id) });
+		} catch (e) {
+			return res.status(404).send('Not found');
+		}
+		if (!u) return res.status(404).send('Not found');
+
+		// si tenemos foto en DB (photoBase64 + photoMime) devolverla
+		if (u.photoBase64 && u.photoMime) {
+			const buf = Buffer.from(u.photoBase64, 'base64');
+			// cachear por un tiempo razonable (puedes ajustar Cache-Control)
+			res.setHeader('Content-Type', u.photoMime);
+			res.setHeader('Cache-Control', 'public, max-age=86400'); // 1 día
+			return res.send(buf);
+		}
+
+		// fallback: si existía photoUrl que apunta a uploads (por compatibilidad), intentar servir desde FS
+		if (u.photoUrl && u.photoUrl.startsWith('/uploads/')) {
+			const filepath = path.join(__dirname, u.photoUrl.replace('/uploads/', 'uploads/'));
+			if (fs.existsSync(filepath)) {
+				const stat = fs.statSync(filepath);
+				res.setHeader('Content-Type', 'application/octet-stream');
+				res.setHeader('Cache-Control', 'public, max-age=86400');
+				return res.sendFile(filepath);
+			}
+		}
+
+		// no hay foto
+		return res.status(404).send('Not found');
+	} catch (err) {
+		console.error('GET user photo error', err);
+		res.status(500).send('Error');
 	}
 });
 
@@ -840,3 +889,5 @@ server.listen(PORT, '0.0.0.0', () => {
 	console.log(`Servidor escuchando en puerto ${PORT}`);
 	console.log(`Socket.IO origin permitido: ${RENDER_URL}`);
 });
+
+
