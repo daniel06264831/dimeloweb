@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const crypto = require('crypto');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 const server = http.createServer(app);
@@ -23,109 +24,167 @@ app.get('/restaurante', (req, res) => res.sendFile(path.join(__dirname, 'public'
 // namespace para restaurante
 const restauranteNs = io.of('/restaurante');
 
-// simple persistence de usuarios en users.json
-const USERS_FILE = path.join(__dirname, 'users.json');
-function readUsers() {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return {};
-    const raw = fs.readFileSync(USERS_FILE, 'utf8');
-    return JSON.parse(raw || '{}');
-  } catch (e) { return {}; }
-}
-function writeUsers(u) {
-  try { fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2), 'utf8'); } catch (e) {}
+// --- NEW (MongoDB) ---
+const MONGO_URI = 'mongodb+srv://daniel:daniel25@so.k6u9iol.mongodb.net/?retryWrites=true&w=majority&appName=so&authSource=admin';
+
+let mongoClient = null;
+let db = null;
+let usersCol = null;
+let promotersCol = null;
+let ordersCol = null;
+
+async function initMongo() {
+	// connect with a small timeout
+	mongoClient = new MongoClient(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+	await mongoClient.connect();
+	db = mongoClient.db('sushi_app'); // DB name
+	usersCol = db.collection('users');
+	promotersCol = db.collection('promoters');
+	ordersCol = db.collection('orders');
+
+	// ensure indexes for quick lookups
+	await usersCol.createIndex({ phone: 1 }, { unique: true, sparse: true });
+	await promotersCol.createIndex({ code: 1 }, { unique: true, sparse: true });
+	await promotersCol.createIndex({ phone: 1 }, { sparse: true });
+	await ordersCol.createIndex({ id: 1 }, { unique: true, sparse: true });
 }
 
-// generar token seguro
+// --- replace file-based helpers with Mongo-backed helpers ---
+
+async function readUsers() {
+	if (!usersCol) return {};
+	const arr = await usersCol.find({}).toArray();
+	const obj = {};
+	for (const u of arr) obj[String(u.phone)] = u;
+	return obj;
+}
+async function writeUsers(uMap) {
+	if (!usersCol) return;
+	// upsert each user object (preserve provided id/token etc)
+	for (const phone of Object.keys(uMap)) {
+		const doc = Object.assign({}, uMap[phone]);
+		await usersCol.updateOne({ phone: String(phone) }, { $set: doc }, { upsert: true });
+	}
+}
+
 function genToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
-function verifyToken(phone, token) {
+async function verifyToken(phone, token) {
   if (!phone || !token) return false;
-  const users = readUsers();
-  const u = users[String(phone)];
+  if (!usersCol) return false;
+  const u = await usersCol.findOne({ phone: String(phone) });
   return !!(u && u.token && u.token === String(token));
 }
 
-// API: registro (genera token)
-app.post('/api/register', (req, res) => {
-  const { name, phone } = req.body || {};
-  if (!phone || !name) return res.json({ ok: false, error: 'Faltan campos' });
-  const users = readUsers();
-  if (users[phone]) return res.json({ ok: false, error: 'Número ya registrado' });
-  const token = genToken();
-  const user = { id: `u_${Date.now()}`, name: String(name), phone: String(phone), token };
-  users[phone] = user;
-  writeUsers(users);
-  return res.json({ ok: true, user });
-});
-// API: login (por teléfono) - devuelve token existente o crea uno si falta
-app.post('/api/login', (req, res) => {
-  const { phone } = req.body || {};
-  if (!phone) return res.json({ ok: false, error: 'Falta teléfono' });
-  const users = readUsers();
-  if (!users[phone]) return res.json({ ok: false, error: 'Usuario no encontrado' });
-  if (!users[phone].token) {
-    users[phone].token = genToken();
-    writeUsers(users);
-  }
-  return res.json({ ok: true, user: users[phone] });
-});
-
-// endpoint de verificación opcional
-app.post('/api/verify-session', (req, res) => {
-  const { phone, token } = req.body || {};
-  if (verifyToken(phone, token)) return res.json({ ok: true });
-  return res.json({ ok: false });
-});
-
-// --- NUEVO: simple persistence para promotores ---
-const PROMOTERS_FILE = path.join(__dirname, 'promoters.json');
-function readPromoters() {
-  try {
-    if (!fs.existsSync(PROMOTERS_FILE)) return {};
-    const raw = fs.readFileSync(PROMOTERS_FILE, 'utf8');
-    return JSON.parse(raw || '{}');
-  } catch (e) { return {}; }
+// --- promoters persistence using Mongo ---
+async function readPromoters() {
+	if (!promotersCol) return {};
+	const arr = await promotersCol.find({}).toArray();
+	const obj = {};
+	for (const p of arr) {
+		// ensure code is uppercase key
+		const code = String(p.code || p._id || '').toUpperCase();
+		if (code) obj[code] = p;
+	}
+	return obj;
 }
-function writePromoters(p) {
-  try { fs.writeFileSync(PROMOTERS_FILE, JSON.stringify(p, null, 2), 'utf8'); } catch (e) {}
+async function writePromoters(pMap) {
+	if (!promotersCol) return;
+	for (const code of Object.keys(pMap)) {
+		const doc = Object.assign({}, pMap[code]);
+		const codeKey = String(code).toUpperCase();
+		doc.code = codeKey;
+		await promotersCol.updateOne({ code: codeKey }, { $set: doc }, { upsert: true });
+	}
 }
 function genPromoCode() {
-  // 6 chars alfanum mayúsculas
   return crypto.randomBytes(3).toString('hex').toUpperCase();
 }
 
-// API: registrar promotor (genera promoCode y guarda datos no sensibles)
-app.post('/api/promoter/register', (req, res) => {
+// --- orders persistence using Mongo ---
+async function readOrders() {
+	if (!ordersCol) return {};
+	const arr = await ordersCol.find({}).toArray();
+	const obj = {};
+	for (const o of arr) obj[String(o.id)] = o;
+	return obj;
+}
+async function writeOrders(oMap) {
+	if (!ordersCol) return;
+	for (const id of Object.keys(oMap)) {
+		const doc = Object.assign({}, oMap[id]);
+		await ordersCol.updateOne({ id: String(id) }, { $set: doc }, { upsert: true });
+	}
+}
+function genOrderId() {
+  return `o_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+}
+
+// --- Adapt Express endpoints to async handlers ---
+// Example: registration endpoint converted
+app.post('/api/register', async (req, res) => {
+  try {
+    const { name, phone } = req.body || {};
+    if (!phone || !name) return res.json({ ok: false, error: 'Faltan campos' });
+    const existing = await usersCol.findOne({ phone: String(phone) });
+    if (existing) return res.json({ ok: false, error: 'Número ya registrado' });
+    const token = genToken();
+    const user = { id: `u_${Date.now()}`, name: String(name), phone: String(phone), token };
+    await usersCol.insertOne(user);
+    return res.json({ ok: true, user });
+  } catch (err) {
+    console.error('Error /api/register:', err);
+    return res.status(500).json({ ok: false, error: 'Error interno' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const { phone } = req.body || {};
+    if (!phone) return res.json({ ok: false, error: 'Falta teléfono' });
+    const user = await usersCol.findOne({ phone: String(phone) });
+    if (!user) return res.json({ ok: false, error: 'Usuario no encontrado' });
+    if (!user.token) {
+      user.token = genToken();
+      await usersCol.updateOne({ phone: String(phone) }, { $set: { token: user.token } });
+    }
+    return res.json({ ok: true, user });
+  } catch (err) {
+    console.error('Error /api/login:', err);
+    return res.status(500).json({ ok: false, error: 'Error interno' });
+  }
+});
+
+app.post('/api/verify-session', async (req, res) => {
+  try {
+    const { phone, token } = req.body || {};
+    const ok = await verifyToken(phone, token);
+    return res.json({ ok });
+  } catch (err) {
+    console.error('Error /api/verify-session:', err);
+    return res.status(500).json({ ok: false, error: 'Error interno' });
+  }
+});
+
+// --- promoter register/login (both aliases) ---
+app.post('/api/promoter/register', async (req, res) => {
   try {
     const { name, phone, cardName, cardNumber } = req.body || {};
     if (!name || !phone || !cardName || !cardNumber) return res.json({ ok: false, error: 'Faltan campos' });
 
-    const promoters = readPromoters();
+    // check duplicates by phone
+    const exists = await promotersCol.findOne({ phone: String(phone) });
+    if (exists) return res.json({ ok: false, error: 'Teléfono ya registrado. Inicia sesión.', promoter: exists });
 
-    // NO permitir duplicados por teléfono
-    for (const code of Object.keys(promoters)) {
-      const p = promoters[code];
-      if (p && String(p.phone) === String(phone)) {
-        return res.json({ ok: false, error: 'Teléfono ya registrado. Inicia sesión.', promoter: p });
-      }
-    }
-
-    // generar código único (asegurar no colisión)
     let code;
-    do { code = genPromoCode(); } while (promoters[code]);
+    do { code = genPromoCode(); } while (await promotersCol.findOne({ code }));
 
-    // almacenar solo últimos 4 dígitos de la tarjeta por seguridad
     const last4 = String(cardNumber).slice(-4);
-
-    // almacenar número completo (local dev). Si prefieres no guardar el número completo,
-    // cambia esto para almacenar solo el último 4 o encriptarlo.
     const fullCard = String(cardNumber);
 
-    // Guardar el usuario junto con el código en el objeto
-    promoters[code] = {
+    const promoterDoc = {
       code,
       usuario: {
         name: String(name),
@@ -141,98 +200,44 @@ app.post('/api/promoter/register', (req, res) => {
       ordersCount: 0,
       generatedAmount: 0.0,
       balance: 0.0,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      payouts: []
     };
-    writePromoters(promoters);
-    return res.json({ ok: true, promoter: promoters[code] });
+    await promotersCol.insertOne(promoterDoc);
+    return res.json({ ok: true, promoter: promoterDoc });
   } catch (err) {
-    console.error('Error register promoter:', err);
-    return res.json({ ok: false, error: 'Error interno' });
+    console.error('Error /api/promoter/register:', err);
+    return res.status(500).json({ ok: false, error: 'Error interno' });
   }
 });
-// --- ALIAS: permitir "promotor" (misma lógica) ---
-app.post('/api/promotor/register', (req, res) => {
-  try {
-    const { name, phone, cardName, cardNumber } = req.body || {};
-    if (!name || !phone || !cardName || !cardNumber) return res.json({ ok: false, error: 'Faltan campos' });
-
-    const promoters = readPromoters();
-    for (const code of Object.keys(promoters)) {
-      const p = promoters[code];
-      if (p && String(p.phone) === String(phone)) {
-        return res.json({ ok: false, error: 'Teléfono ya registrado. Inicia sesión.', promoter: p });
-      }
-    }
-    let code;
-    do { code = genPromoCode(); } while (promoters[code]);
-    const last4 = String(cardNumber).slice(-4);
-    const fullCard = String(cardNumber);
-    promoters[code] = {
-      code,
-      name: String(name),
-      phone: String(phone),
-      cardName: String(cardName),
-      cardLast4: last4,
-      cardNumberFull: fullCard,
-      ordersCount: 0,
-      generatedAmount: 0.0,
-      balance: 0.0,
-      createdAt: Date.now()
-    };
-    writePromoters(promoters);
-    return res.json({ ok: true, promoter: promoters[code] });
-  } catch (err) {
-    console.error('Error register promotor alias:', err);
-    return res.json({ ok: false, error: 'Error interno' });
-  }
+// alias /api/promotor/register -> reuse above
+app.post('/api/promotor/register', async (req, res) => {
+  return app._router.handle(req, res, () => {}); // delegate to previous handler
 });
 
-// --- NUEVO: login de promotor por teléfono (devuelve promotor si existe)
-app.post('/api/promoter/login', (req, res) => {
+app.post('/api/promoter/login', async (req, res) => {
   try {
     const { phone } = req.body || {};
     if (!phone) return res.json({ ok: false, error: 'Falta teléfono' });
-    const promoters = readPromoters();
-    for (const code of Object.keys(promoters)) {
-      const p = promoters[code];
-      if (p && String(p.phone) === String(phone)) {
-        // Devolver el objeto completo, incluyendo el código y usuario
-        return res.json({ ok: true, promoter: p });
-      }
-    }
+    const p = await promotersCol.findOne({ phone: String(phone) });
+    if (p) return res.json({ ok: true, promoter: p });
     return res.json({ ok: false, error: 'Promotor no encontrado' });
   } catch (err) {
-    console.error('Error promoter login:', err);
-    return res.json({ ok: false, error: 'Error interno' });
+    console.error('Error /api/promoter/login:', err);
+    return res.status(500).json({ ok: false, error: 'Error interno' });
   }
 });
-// --- ALIAS: aceptar también /api/promotor/login ---
-app.post('/api/promotor/login', (req, res) => {
-  try {
-    const { phone } = req.body || {};
-    if (!phone) return res.json({ ok: false, error: 'Falta teléfono' });
-    const promoters = readPromoters();
-    for (const code of Object.keys(promoters)) {
-      const p = promoters[code];
-      if (p && String(p.phone) === String(phone)) {
-        return res.json({ ok: true, promoter: p });
-      }
-    }
-    return res.json({ ok: false, error: 'Promotor no encontrado' });
-  } catch (err) {
-    console.error('Error promotor alias login:', err);
-    return res.json({ ok: false, error: 'Error interno' });
-  }
+app.post('/api/promotor/login', async (req, res) => {
+  return app._router.handle(req, res, () => {});
 });
 
-// --- NEW: obtener estadísticas de un promotor por código (GET) ---
-app.get('/api/promoter/:code/stats', (req, res) => {
+// GET promoter stats by code
+app.get('/api/promoter/:code/stats', async (req, res) => {
   try {
     const raw = String(req.params.code || '').trim();
     if (!raw) return res.status(400).json({ ok: false, error: 'Código vacío' });
     const code = raw.toUpperCase();
-    const promoters = readPromoters();
-    const p = promoters[code] || null;
+    const p = await promotersCol.findOne({ code });
     if (p) return res.json({ ok: true, promoter: p });
     return res.status(404).json({ ok: false, error: 'Promotor no encontrado' });
   } catch (err) {
@@ -240,9 +245,7 @@ app.get('/api/promoter/:code/stats', (req, res) => {
     return res.status(500).json({ ok: false, error: 'Error interno' });
   }
 });
-// alias con ortografía alternativa 'promotor'
 app.get('/api/promotor/:code/stats', (req, res) => {
-  // reutilizar la ruta anterior
   return app._router.handle(req, res, () => {});
 });
 
@@ -266,31 +269,28 @@ function genOrderId() {
 io.on('connection', (socket) => {
   console.log('Cliente conectado:', socket.id);
 
-  socket.on('nuevo-pedido', (pedido) => {
+  socket.on('nuevo-pedido', async (pedido) => {
     try {
       const phone = pedido && (pedido.phone || pedido.customer?.phone);
       const token = pedido && pedido.token;
 
       // Si el cliente envía token => verificar. Si no envía token (guest) permitir.
       if (token) {
-        if (!verifyToken(phone, token)) {
+        if (!await verifyToken(phone, token)) {
           socket.emit('auth-error', { error: 'Autenticación inválida' });
           return;
         }
       } // else: guest checkout, continuar
 
       // adjuntar info del usuario antes de reenviar
-      const users = readUsers();
-      const user = users[String(phone)];
+      const user = phone ? await usersCol.findOne({ phone: String(phone) }) : null;
       const out = Object.assign({}, pedido, { userId: user?.id || null, phone: user?.phone || phone, timestamp: pedido.timestamp || Date.now() });
 
       // asignar id y estado, persistir
-      const ordersObj = readOrders();
       const id = out.id || genOrderId();
       out.id = id;
       out.status = out.status || 'pending';
-      ordersObj[id] = out;
-      writeOrders(ordersObj);
+      await ordersCol.updateOne({ id }, { $set: out }, { upsert: true });
 
       console.log('Nuevo pedido validado y guardado:', out);
       restauranteNs.emit('pedido', out);
@@ -299,25 +299,22 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('checkout', (payload) => {
+  socket.on('checkout', async (payload) => {
     try {
       const phone = payload && (payload.phone || payload.customer?.phone);
       const token = payload && payload.token;
-
-      // Si el cliente envía token => verificar. Si no envía token (guest) permitir.
       if (token) {
-        if (!verifyToken(phone, token)) {
+        if (!await verifyToken(phone, token)) {
           socket.emit('auth-error', { error: 'Autenticación inválida' });
           return;
         }
       } // else: guest checkout, continuar
 
       // --- NUEVO: si viene promoCode aplicar descuento y registrar comisión ---
-      const promoCode = payload && (payload.promoCode || payload.promo_code);
       let promoterMatched = null;
+      const promoCode = payload && (payload.promoCode || payload.promo_code);
       if (promoCode) {
-        const promoters = readPromoters();
-        const p = promoters[String(promoCode).toUpperCase()];
+        const p = await promotersCol.findOne({ code: String(promoCode).toUpperCase() });
         if (p) {
           promoterMatched = p;
           // calcular descuento del 30% sobre subtotal
@@ -339,33 +336,24 @@ io.on('connection', (socket) => {
           payload.promoApplied = { code: promoCode, discount, commission };
 
           // actualizar estadísticas del promotor y persistir
-          const promotersObj = readPromoters();
-          const stored = promotersObj[String(promoCode).toUpperCase()];
-          if (stored) {
-            stored.ordersCount = (stored.ordersCount || 0) + 1;
-            stored.generatedAmount = Math.round((Number(stored.generatedAmount || 0) + commission) * 100) / 100;
-            stored.balance = Math.round((Number(stored.balance || 0) + commission) * 100) / 100;
-            promotersObj[String(promoCode).toUpperCase()] = stored;
-            writePromoters(promotersObj);
-            promoterMatched = stored;
-          }
+          const update = {
+            $inc: { ordersCount: 1, generatedAmount: commission, balance: commission }
+          };
+          await promotersCol.updateOne({ code: p.code }, update);
+          promoterMatched = await promotersCol.findOne({ code: p.code });
         }
       }
 
-      const users = readUsers();
-      const user = users[String(phone)];
+      const user = phone ? await usersCol.findOne({ phone: String(phone) }) : null;
       const out = Object.assign({}, payload, { userId: user?.id || null, phone: user?.phone || phone, timestamp: payload.timestamp || Date.now() });
 
       // asignar id y estado, persistir (incluir tip y cambio si vienen)
-      const ordersObj = readOrders();
       const id = out.id || genOrderId();
       out.id = id;
       out.status = out.status || 'pending';
-      // ensure changeFor field preserved (may be named changeFor or change)
       out.changeFor = typeof out.changeFor !== 'undefined' ? out.changeFor : (out.change || 0);
       out.tip = Number(out.tip || 0);
-      ordersObj[id] = out;
-      writeOrders(ordersObj);
+      await ordersCol.updateOne({ id }, { $set: out }, { upsert: true });
 
       console.log('Checkout validado y guardado:', out);
       restauranteNs.emit('checkout', out);
@@ -383,16 +371,13 @@ io.on('connection', (socket) => {
   });
 
   // recibir marca de pedido finalizado desde restaurante (actualiza persistencia)
-  socket.on('order-finished', (msg) => {
+  socket.on('order-finished', async (msg) => {
     try {
       const id = msg && (msg.id || msg.orderId);
       if (!id) return;
-      const ordersObj = readOrders();
-      if (ordersObj[id]) {
-        ordersObj[id].status = 'finished';
-        ordersObj[id].finishedAt = Date.now();
-        writeOrders(ordersObj);
-        // notificar a namespace/restaurante y clientes conectados
+      const order = await ordersCol.findOne({ id });
+      if (order) {
+        await ordersCol.updateOne({ id }, { $set: { status: 'finished', finishedAt: Date.now() } });
         restauranteNs.emit('order-finished', { id });
         io.emit('order-updated', { id, status: 'finished' });
       }
@@ -400,12 +385,11 @@ io.on('connection', (socket) => {
   });
 
   // --- NUEVO: marcar pedido como pagado (aplica comisión al promotor si existe y no está liquidada) ---
-  socket.on('order-paid', (msg) => {
+  socket.on('order-paid', async (msg) => {
     try {
       const id = msg && (msg.id || msg.orderId);
       if (!id) return;
-      const ordersObj = readOrders();
-      const order = ordersObj[id];
+      const order = await ordersCol.findOne({ id });
       if (!order) return;
 
       // evitar volver a liquidar si ya se hizo
@@ -416,30 +400,20 @@ io.on('connection', (socket) => {
 
         // actualizar promotor solamente si existe
         if (promoCode) {
-          const promotersObj = readPromoters();
-          const stored = promotersObj[promoCode];
+          const stored = await promotersCol.findOne({ code: promoCode });
           if (stored) {
-            stored.ordersCount = (stored.ordersCount || 0) + 1;
-            stored.generatedAmount = Math.round((Number(stored.generatedAmount || 0) + commission) * 100) / 100;
-            stored.balance = Math.round((Number(stored.balance || 0) + commission) * 100) / 100;
-            promotersObj[promoCode] = stored;
-            writePromoters(promotersObj);
-            // notificar a promotores y clientes
-            io.emit('promoter-updated', { code: promoCode, ordersCount: stored.ordersCount, generatedAmount: stored.generatedAmount });
+            await promotersCol.updateOne({ code: promoCode }, { $inc: { ordersCount: 1, generatedAmount: commission, balance: commission } });
+            const updated = await promotersCol.findOne({ code: promoCode });
+            io.emit('promoter-updated', { code: promoCode, ordersCount: updated.ordersCount, generatedAmount: updated.generatedAmount });
             io.emit('promoter-favor', { code: promoCode, orderId: id, amount: commission, customer: order.customer || order.customer });
           }
         }
         // marcar como liquidado en el pedido
-        order.promoSettled = true;
+        await ordersCol.updateOne({ id }, { $set: { promoSettled: true } });
       }
 
       // marcar pedido como pagado y persistir
-      order.status = 'paid';
-      order.paidAt = Date.now();
-      ordersObj[id] = order;
-      writeOrders(ordersObj);
-
-      // notificar UI restaurante y demás clientes
+      await ordersCol.updateOne({ id }, { $set: { status: 'paid', paidAt: Date.now() } });
       restauranteNs.emit('order-updated', { id, status: 'paid' });
       io.emit('order-updated', { id, status: 'paid' });
     } catch (e) {
@@ -448,21 +422,15 @@ io.on('connection', (socket) => {
   });
 
   // --- NUEVO: marcar pedido como cancelado (no aplica comisión) ---
-  socket.on('order-cancelled', (msg) => {
+  socket.on('order-cancelled', async (msg) => {
     try {
       const id = msg && (msg.id || msg.orderId);
       if (!id) return;
-      const ordersObj = readOrders();
-      const order = ordersObj[id];
+      const order = await ordersCol.findOne({ id });
       if (!order) return;
 
       // marcar cancelado y persistir; no aplicar comisión
-      order.status = 'cancelled';
-      order.cancelledAt = Date.now();
-      ordersObj[id] = order;
-      writeOrders(ordersObj);
-
-      // notificar UI restaurante y promotores (si es necesario)
+      await ordersCol.updateOne({ id }, { $set: { status: 'cancelled', cancelledAt: Date.now() } });
       restauranteNs.emit('order-updated', { id, status: 'cancelled' });
       io.emit('order-updated', { id, status: 'cancelled' });
     } catch (e) {
@@ -471,13 +439,10 @@ io.on('connection', (socket) => {
   });
 });
 
-// --- NUEVO: endpoint para obtener pedidos persistidos ---
-app.get('/api/orders', (req, res) => {
+// --- API: list orders (from Mongo) ---
+app.get('/api/orders', async (req, res) => {
   try {
-    const ordersObj = readOrders();
-    // devolver array ordenado por timestamp descendente
-    const arr = Object.keys(ordersObj).map(k => ordersObj[k]).sort((a,b)=> (b.timestamp||0) - (a.timestamp||0));
-    // por defecto devolver sólo pendientes (no finished), permitir ?all=1 para todos
+    const arr = await ordersCol.find({}).sort({ timestamp: -1 }).toArray();
     const all = req.query.all === '1';
     const filtered = all ? arr : arr.filter(o => o.status !== 'finished');
     return res.json({ ok: true, orders: filtered });
@@ -487,11 +452,10 @@ app.get('/api/orders', (req, res) => {
   }
 });
 
-// ---------- NUEVO: listar todos los promotores ----------
-app.get('/api/promoters', (req, res) => {
+// list promoters
+app.get('/api/promoters', async (req, res) => {
   try {
-    const promoters = readPromoters();
-    const arr = Object.keys(promoters).map(k => promoters[k]);
+    const arr = await promotersCol.find({}).toArray();
     return res.json({ ok: true, promoters: arr });
   } catch (err) {
     console.error('GET /api/promoters error', err);
@@ -499,8 +463,8 @@ app.get('/api/promoters', (req, res) => {
   }
 });
 
-// ---------- NUEVO: registrar pago semanal para un promotor ----------
-app.post('/api/promoter/:code/settle', (req, res) => {
+// settle promoter payout
+app.post('/api/promoter/:code/settle', async (req, res) => {
   try {
     const codeRaw = String(req.params.code || '').trim();
     if (!codeRaw) return res.status(400).json({ ok: false, error: 'Código vacío' });
@@ -509,31 +473,20 @@ app.post('/api/promoter/:code/settle', (req, res) => {
     const amt = Math.round((Number(amount) || 0) * 100) / 100;
     if (amt <= 0) return res.status(400).json({ ok: false, error: 'Monto inválido' });
 
-    const promoters = readPromoters();
-    const p = promoters[code];
+    const p = await promotersCol.findOne({ code });
     if (!p) return res.status(404).json({ ok: false, error: 'Promotor no encontrado' });
 
-    // crear registro de payout
-    p.payouts = p.payouts || [];
-    p.payouts.push({
-      amount: amt,
-      weekStart: weekStart || null,
-      weekEnd: weekEnd || null,
-      paidAt: Date.now()
-    });
+    const payouts = p.payouts || [];
+    payouts.push({ amount: amt, weekStart: weekStart || null, weekEnd: weekEnd || null, paidAt: Date.now() });
 
-    // disminuir balance (no permitir balance negativo por aquí, pero registramos la operación)
-    p.balance = Math.round((Number(p.balance || 0) - amt) * 100) / 100;
-    if (p.balance < 0) p.balance = 0;
+    const newBalance = Math.round((Number(p.balance || 0) - amt) * 100) / 100;
+    await promotersCol.updateOne({ code }, { $set: { payouts, balance: newBalance < 0 ? 0 : newBalance } });
+    const updated = await promotersCol.findOne({ code });
 
-    promoters[code] = p;
-    writePromoters(promoters);
+    io.emit('promoter-paid', { code, amount: amt, weekStart, weekEnd, promoter: updated });
+    io.emit('promoter-updated', { code: updated.code || code, ordersCount: updated.ordersCount || 0, generatedAmount: updated.generatedAmount || 0 });
 
-    // notificar a clientes/promotores conectados
-    io.emit('promoter-paid', { code, amount: amt, weekStart, weekEnd, promoter: p });
-    io.emit('promoter-updated', { code: p.code || code, ordersCount: p.ordersCount || 0, generatedAmount: p.generatedAmount || 0 });
-
-    return res.json({ ok: true, promoter: p });
+    return res.json({ ok: true, promoter: updated });
   } catch (err) {
     console.error('POST /api/promoter/:code/settle error', err);
     return res.status(500).json({ ok: false, error: 'Error interno' });
@@ -557,7 +510,12 @@ function getLocalIp() {
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0'; // escuchar en todas las interfaces para accesibilidad en la red
 
-server.listen(PORT, HOST, () => {
+initMongo().then(() => {
   const ip = getLocalIp();
-  console.log(`Servidor escuchando en http://${ip}:${PORT} (también en http://localhost:${PORT})`);
+  server.listen(PORT, HOST, () => {
+    console.log(`Servidor (Mongo) escuchando en http://${ip}:${PORT} (también en http://localhost:${PORT})`);
+  });
+}).catch(err => {
+  console.error('No se pudo conectar a MongoDB:', err);
+  process.exit(1);
 });
