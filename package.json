@@ -1,13 +1,14 @@
 {
   "name": "so-sushi",
   "version": "1.0.0",
-  "description": "App SO Sushi - cliente, promotor y restaurante con Socket.IO",
+  "description": "SO Sushi app",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "socket.io": "^4.7.2"
+    "mongodb": "^5.9.2",
+    "socket.io": "^4.7.1"
   }
 }
