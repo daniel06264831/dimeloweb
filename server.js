@@ -16,9 +16,9 @@ app.use(express.json());
 // servir public en la raíz (ej. /style.css, /main.js, /sushi1.jpg)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// rutas para promotor y restaurante
-app.get('/promotor', (req, res) => res.sendFile(path.join(__dirname, 'promotor', 'index.html')));
-app.get('/restaurante', (req, res) => res.sendFile(path.join(__dirname, 'restaurante', 'restaurante.html')));
+// rutas para promotor y restaurante (servir desde public para despliegue en Render)
+app.get('/promotor', (req, res) => res.sendFile(path.join(__dirname, 'public', 'promotor.html')));
+app.get('/restaurante', (req, res) => res.sendFile(path.join(__dirname, 'public', 'restaurante.html')));
 
 // namespace para restaurante
 const restauranteNs = io.of('/restaurante');
