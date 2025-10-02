@@ -6,10 +6,16 @@ const os = require('os');
 const fs = require('fs');
 const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
+const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+
+// Enable CORS for all routes (allow credentials if needed)
+app.use(cors({ origin: true, credentials: true }));
+// Allow preflight for all routes
+app.options('*', cors());
 
 // permitir JSON bodies
 app.use(express.json());
